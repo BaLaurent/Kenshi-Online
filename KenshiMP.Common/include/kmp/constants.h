@@ -1,13 +1,34 @@
 #pragma once
 #include <cstdint>
+#include <cstddef>
 
 namespace kmp {
 
 // Protocol
-constexpr uint32_t KMP_PROTOCOL_VERSION = 1;
+// v2: breaking handshake change — adds password / host-token / session-token
+// authentication fields (server security hardening, audit 2026-06-03).
+constexpr uint32_t KMP_PROTOCOL_VERSION = 2;
 constexpr uint16_t KMP_DEFAULT_PORT     = 27800;
 constexpr int      KMP_MAX_PLAYERS      = 16;
 constexpr int      KMP_MAX_NAME_LENGTH  = 31;
+
+// Authentication (handshake)
+constexpr int      KMP_MAX_PASSWORD_LENGTH = 63;  // operator server password
+constexpr int      KMP_SESSION_TOKEN_LENGTH = 32; // hex string (16 random bytes); secret identity token
+
+// Resource limits (DoS hardening — audit 2026-06-03)
+constexpr uint32_t    KMP_MAX_PACKET_SIZE     = 64 * 1024; // reject incoming packets larger than this
+constexpr std::size_t KMP_MAX_ENTITIES_PER_PLAYER = 64;    // per-player entity/build cap
+constexpr std::size_t KMP_MAX_SAVED_PLAYERS   = 256;       // cap on persisted reconnect records
+constexpr int         KMP_MAX_CONNECTIONS_PER_IP = 4;      // simultaneous connections from one address
+constexpr int         KMP_RATE_LIMIT_MAX_MSGS = 15;        // burst-sensitive C2S messages per second
+constexpr float       KMP_RATE_LIMIT_WINDOW_SEC = 1.0f;
+// Anti-teleport: max plausible movement speed for a position update (m/s). Kenshi
+// foot speed tops out ~15 m/s; this is generous (≈13×) to absorb 5× game-speed and
+// lag catch-up without false-rejecting legit movement, while still blocking the
+// instant cross-map teleport that defeats the combat/door distance gates (I-01/02/12).
+// Tunable — lower it if cheating teleports stay viable, raise it if legit moves are dropped.
+constexpr float       KMP_MAX_MOVE_SPEED      = 200.0f;
 
 // Tick rates
 constexpr int   KMP_TICK_RATE           = 20;      // 20 Hz state sync

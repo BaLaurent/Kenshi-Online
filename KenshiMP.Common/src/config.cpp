@@ -86,6 +86,13 @@ bool ClientConfig::Load(const std::string& path) {
         if (j.contains("masterServer")) masterServer = j["masterServer"].get<std::string>();
         if (j.contains("masterPort"))   masterPort   = j["masterPort"].get<uint16_t>();
         if (j.contains("useSyncOrchestrator")) useSyncOrchestrator = j["useSyncOrchestrator"].get<bool>();
+        if (j.contains("serverPassword")) serverPassword = j["serverPassword"].get<std::string>();
+        if (j.contains("hostToken"))      hostToken      = j["hostToken"].get<std::string>();
+        if (j.contains("sessionTokens") && j["sessionTokens"].is_object()) {
+            for (auto& [k, v] : j["sessionTokens"].items()) {
+                if (v.is_string()) sessionTokens[k] = v.get<std::string>();
+            }
+        }
 
         // ── Validate loaded values ──
         if (playerName.size() > KMP_MAX_NAME_LENGTH)
@@ -111,6 +118,9 @@ bool ClientConfig::Save(const std::string& path) const {
     j["masterServer"] = masterServer;
     j["masterPort"]   = masterPort;
     j["useSyncOrchestrator"] = useSyncOrchestrator;
+    j["serverPassword"] = serverPassword;
+    j["hostToken"]      = hostToken;
+    j["sessionTokens"]  = sessionTokens;
 
     std::ofstream file(path);
     if (!file.is_open()) return false;
@@ -131,6 +141,7 @@ bool ServerConfig::Load(const std::string& path) {
         if (j.contains("port"))       port       = j["port"].get<uint16_t>();
         if (j.contains("maxPlayers")) maxPlayers = j["maxPlayers"].get<int>();
         if (j.contains("password"))   password   = j["password"].get<std::string>();
+        if (j.contains("hostToken"))  hostToken  = j["hostToken"].get<std::string>();
         if (j.contains("savePath"))   savePath   = j["savePath"].get<std::string>();
         if (j.contains("tickRate"))   tickRate   = j["tickRate"].get<int>();
         if (j.contains("pvpEnabled")) pvpEnabled = j["pvpEnabled"].get<bool>();
@@ -159,6 +170,7 @@ bool ServerConfig::Save(const std::string& path) const {
     j["port"]       = port;
     j["maxPlayers"] = maxPlayers;
     j["password"]   = password;
+    j["hostToken"]  = hostToken;
     j["savePath"]   = savePath;
     j["tickRate"]   = tickRate;
     j["pvpEnabled"] = pvpEnabled;

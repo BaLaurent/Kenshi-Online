@@ -124,7 +124,21 @@ bool PlayerManager::CheckRateLimit(PlayerID id, float currentTime,
 }
 
 void PlayerManager::RecordMessage(PlayerID id, float currentTime) {
-    m_rateLimits[id].timestamps.push_back(currentTime);
+    auto& ts = m_rateLimits[id].timestamps;
+    ts.push_back(currentTime);
+    // Hard cap so a flooder can't grow this vector without bound between the
+    // 30s CleanupRateLimits passes (R3 fix). CheckRateLimit only needs the most
+    // recent few seconds; anything beyond a small window is irrelevant to the
+    // count, so drop the oldest. This keeps CheckRateLimit's scan O(1)-bounded
+    // instead of O(messages-since-last-cleanup).
+    constexpr size_t kMaxTimestamps = 64;
+    if (ts.size() > kMaxTimestamps) {
+        ts.erase(ts.begin(), ts.begin() + (ts.size() - kMaxTimestamps));
+    }
+}
+
+void PlayerManager::RemoveRateLimit(PlayerID id) {
+    m_rateLimits.erase(id);
 }
 
 void PlayerManager::CleanupRateLimits(float currentTime, float windowSeconds) {

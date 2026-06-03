@@ -5,6 +5,7 @@
 #include "kmp/messages.h"
 #include "kmp/constants.h"
 #include "upnp.h"
+#include "player_manager.h"
 #include <enet/enet.h>
 #include <unordered_map>
 #include <string>
@@ -24,6 +25,8 @@ struct ConnectedPlayer {
     float       lastUpdate;
     std::vector<EntityID> ownedEntities;
     bool        lobbyReady = false;
+    std::string sessionToken;   // secret issued at handshake; used to reclaim entities on reconnect
+    std::string ipAddress;      // peer IP, captured at connect for ban enforcement
 };
 
 struct ServerEntity {
@@ -54,14 +57,18 @@ struct ServerEntity {
     uint8_t     moveSpeed = 0;  // 0-255 mapped to 0.0-15.0 m/s
     uint16_t    flags = 0;
     bool        alive = true;
+    float       lastPosTime = 0.f;   // server uptime at last accepted position update (anti-teleport)
     float       buildProgress = 0.f; // 0.0-1.0 for buildings
     uint32_t    equipment[14] = {};  // EquipSlot::Count = 14
 };
 
 // Saved player record -- persisted across restarts so reconnecting
-// players can reclaim their entities.
+// players can reclaim their entities. Keyed by the secret session token
+// (protocol v2), NOT the public display name, so only the original owner
+// who holds the token can reclaim.
 struct SavedPlayer {
-    std::string name;
+    std::string token;   // session token that owns these entities (also the map key)
+    std::string name;    // last known display name (cosmetic / logging only)
     std::vector<EntityID> entityIds;
 };
 
@@ -133,17 +140,24 @@ private:
     // Query handler (responds without handshake for server browser)
     void HandleServerQuery(ENetPeer* peer, PacketReader& reader);
 
+    // Generate a fresh CSPRNG-backed session token (hex string).
+    std::string GenerateSessionToken();
+
     ENetHost* m_host = nullptr;
     ServerConfig m_config;
     std::unordered_map<PlayerID, ConnectedPlayer> m_players;
     std::unordered_map<EntityID, ServerEntity> m_entities;
-    std::unordered_map<std::string, SavedPlayer> m_savedPlayers; // name → saved entities (persisted)
+    std::unordered_map<std::string, SavedPlayer> m_savedPlayers; // session token → saved entities (persisted)
+    PlayerManager m_playerManager;                                // rate limiting, IP bans (wired in v2)
     std::recursive_mutex m_mutex;
 
     PlayerID m_nextPlayerId = 1;
     EntityID m_nextEntityId = 1;
     uint32_t m_nextSquadId = 0x80000000; // Separate ID space for squads (avoids entity ID collisions)
-    PlayerID m_hostPlayerId = 0;  // First connected player = host
+    PlayerID m_hostPlayerId = 0;       // Gameplay host: token-authenticated if hostToken set, else first connector
+    bool     m_hostAuthenticated = false; // True ONLY if the host proved the host token. Admin commands
+                                          // (kick/ban/time/weather) require this — a first-connector fallback
+                                          // host gets gameplay coordination but NOT admin authority (closes I-04).
     uint32_t m_serverTick = 0;
     float    m_timeOfDay = 0.5f;
     int      m_weatherState = 0;

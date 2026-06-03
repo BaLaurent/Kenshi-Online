@@ -17,6 +17,10 @@ struct MsgHandshake {
     uint8_t  gameVersionMinor;
     uint8_t  gameVersionPatch;
     uint8_t  reserved;
+    // ── Authentication (protocol v2) ──
+    char     password[KMP_MAX_PASSWORD_LENGTH + 1];      // operator server password ("" if none)
+    char     hostToken[KMP_SESSION_TOKEN_LENGTH + 1];    // host-designation token ("" if not claiming host)
+    char     sessionToken[KMP_SESSION_TOKEN_LENGTH + 1]; // reclaim token from a prior session ("" on first join)
 };
 
 struct MsgHandshakeAck {
@@ -26,11 +30,15 @@ struct MsgHandshakeAck {
     int32_t  weatherState;
     uint8_t  maxPlayers;
     uint8_t  currentPlayers;
-    uint16_t reserved;
+    uint8_t  isHost;     // 1 if this client was granted host (protocol v2)
+    uint8_t  reserved;
+    // Server-issued session token (protocol v2): client MUST persist this per-server
+    // and send it back in MsgHandshake.sessionToken to reclaim its entities on reconnect.
+    char     sessionToken[KMP_SESSION_TOKEN_LENGTH + 1];
 };
 
 struct MsgHandshakeReject {
-    uint8_t  reasonCode; // 0=full, 1=version mismatch, 2=banned, 3=other
+    uint8_t  reasonCode; // 0=full, 1=version mismatch, 2=banned, 3=other, 4=bad password
     char     reasonText[128];
 };
 

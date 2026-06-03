@@ -28,7 +28,7 @@ bool SaveWorldToFile(const std::string& path,
                      const std::unordered_map<std::string, SavedPlayer>& savedPlayers,
                      float timeOfDay, int weatherState) {
     json j;
-    j["version"] = 2;
+    j["version"] = 3; // v3: m_savedPlayers keyed by session token (was display name)
     j["timeOfDay"] = timeOfDay;
     j["weather"] = weatherState;
 
@@ -58,12 +58,15 @@ bool SaveWorldToFile(const std::string& path,
     }
     j["entities"] = entityArray;
 
-    // Save player→entity mapping so reconnecting players can reclaim entities
+    // Save token→entity mapping so reconnecting players can reclaim entities.
+    // Keyed by the secret session token (v3); shape is identical to v2 so an
+    // older v2 save still parses (its name-keys become dead tokens, harmlessly
+    // orphan-cleaned), avoiding a parse-throw → world wipe on load.
     json playersObj = json::object();
-    for (auto& [name, sp] : savedPlayers) {
+    for (auto& [token, sp] : savedPlayers) {
         json ids = json::array();
         for (EntityID eid : sp.entityIds) ids.push_back(eid);
-        playersObj[name] = ids;
+        playersObj[token] = ids;
     }
     j["players"] = playersObj;
 
@@ -77,7 +80,10 @@ bool SaveWorldToFile(const std::string& path,
             spdlog::error("SaveWorld: Failed to open '{}'", tmpPath);
             return false;
         }
-        file << j.dump(2);
+        // error_handler_t::replace: never throw on invalid UTF-8 in a stored
+        // string (e.g. an attacker-supplied templateName) — substitute U+FFFD
+        // instead, so a single crafted name can't crash the autosave (I-09).
+        file << j.dump(2, ' ', false, json::error_handler_t::replace);
         file.flush();
         if (!file.good()) {
             spdlog::error("SaveWorld: Write/flush failed for '{}'", tmpPath);
@@ -185,9 +191,18 @@ bool LoadWorldFromFile(const std::string& path,
             entity.zone = ZoneCoord::FromWorldPos(entity.position);
             entity.alive = e.value("alive", true);
 
-            auto& health = e["health"];
-            for (int i = 0; i < 7 && i < static_cast<int>(health.size()); i++) {
-                entity.health[i] = health[i];
+            // Defensive: a NaN/Inf health serializes as JSON null, and a raw
+            // `entity.health[i] = health[i]` would throw type_error::302 → the
+            // catch below would wipe the entire saved world (I-10). Skip any
+            // non-finite/non-number value and keep the 100.f default instead.
+            if (e.contains("health") && e["health"].is_array()) {
+                auto& health = e["health"];
+                for (int i = 0; i < 7 && i < static_cast<int>(health.size()); i++) {
+                    if (health[i].is_number()) {
+                        float h = health[i].get<float>();
+                        if (std::isfinite(h)) entity.health[i] = h;
+                    }
+                }
             }
 
             entity.templateName = e.value("templateName", std::string{});
@@ -206,16 +221,18 @@ bool LoadWorldFromFile(const std::string& path,
 
         // Load player→entity mapping (version 2+)
         if (j.contains("players") && j["players"].is_object()) {
-            for (auto& [name, ids] : j["players"].items()) {
+            for (auto& [token, ids] : j["players"].items()) {
+                if (!ids.is_array()) continue;
                 SavedPlayer sp;
-                sp.name = name;
+                sp.token = token;   // v3 key is the secret session token
                 for (auto& eid : ids) {
+                    if (!eid.is_number_unsigned()) continue;
                     EntityID id = eid.get<EntityID>();
                     // Only keep references to entities that actually loaded
                     if (entities.count(id)) sp.entityIds.push_back(id);
                 }
                 if (!sp.entityIds.empty()) {
-                    savedPlayers[name] = std::move(sp);
+                    savedPlayers[token] = std::move(sp);
                 }
             }
             spdlog::info("LoadWorld: Loaded {} saved player records", savedPlayers.size());

@@ -244,10 +244,24 @@ private:
         core.SetConnected(true);
         core.TransitionTo(ClientPhase::Connected);
 
-        // Determine if we're the host (player ID 1 = first connected = host)
-        if (msg.currentPlayers <= 1) {
+        // Persist the server-issued session token (protocol v2), keyed per-server,
+        // so a later reconnect reclaims our entities. Force-terminate first (RC4).
+        msg.sessionToken[KMP_SESSION_TOKEN_LENGTH] = '\0';
+        auto& cfg = core.GetConfig();
+        std::string serverKey = cfg.lastServer + ":" + std::to_string(cfg.lastPort);
+        if (msg.sessionToken[0] != '\0') {
+            cfg.sessionTokens[serverKey] = msg.sessionToken;
+            // Persist to the SHARED default path (the one loaded at startup), not
+            // the PID-specific instance path — otherwise the token is written to a
+            // file no future process ever reads and cross-restart reclaim is dead (R4).
+            cfg.Save(ClientConfig::GetDefaultPath());
+        }
+
+        // Host status is now decided authoritatively by the server (it set isHost
+        // based on the host token we presented), not by connection order.
+        if (msg.isHost) {
             core.SetIsHost(true);
-            spdlog::info("PacketHandler: We are the HOST");
+            spdlog::info("PacketHandler: We are the HOST (server-confirmed)");
         }
 
         // Initialize the player controller with our ID and name

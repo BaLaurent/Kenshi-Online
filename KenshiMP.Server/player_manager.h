@@ -54,6 +54,9 @@ public:
     bool CheckRateLimit(PlayerID id, float currentTime, float windowSeconds = 1.f, int maxMessages = 10);
     void RecordMessage(PlayerID id, float currentTime);
     void CleanupRateLimits(float currentTime, float windowSeconds = 5.f);
+    // Drop a disconnected player's rate-limit entry so the map can't grow without
+    // bound under connect/disconnect churn (PlayerID is monotonic, never recycled).
+    void RemoveRateLimit(PlayerID id);
 
 private:
     std::unordered_set<std::string> m_bannedIPs;

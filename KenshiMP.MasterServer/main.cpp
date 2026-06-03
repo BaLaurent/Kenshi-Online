@@ -44,6 +44,18 @@ std::atomic<bool> g_running{true};
 constexpr float HEARTBEAT_TIMEOUT_SEC = 90.f; // Remove after 90s no heartbeat
 constexpr uint16_t DEFAULT_MASTER_PORT = 27801;
 constexpr int MAX_CONNECTIONS = 128;
+constexpr size_t MAX_REGISTERED_SERVERS = 1024; // hard cap on the registry (anti-flood, I-18)
+constexpr size_t MAX_SERVERS_PER_PEER   = 4;    // one connection can't flood many listings
+
+// Treat a fixed network char buffer as a C-string safely: force a NUL at the
+// last byte before constructing a std::string (RC4 — over-read prevention).
+template <size_t N>
+static std::string SafeField(const char (&buf)[N]) {
+    char tmp[N];
+    std::memcpy(tmp, buf, N);
+    tmp[N - 1] = '\0';
+    return std::string(tmp);
+}
 
 void SignalHandler(int) {
     g_running = false;
@@ -76,12 +88,32 @@ void HandleRegister(ENetPeer* peer, const uint8_t* data, size_t size) {
 
     std::string peerIP = PeerAddressString(peer);
 
-    // Use peer's actual IP if server didn't provide one
-    std::string externalIP = msg.externalIP[0] ? std::string(msg.externalIP) : peerIP;
+    // Always key on the peer's REAL source IP — never the self-reported
+    // externalIP (I-18): otherwise one server could register/overwrite another
+    // server's listing by spoofing its address. The peer IP is the server's
+    // genuine public address (it connected out to us).
+    std::string externalIP = peerIP;
     std::string key = MakeKey(externalIP, msg.gamePort);
 
+    bool isNew = (g_servers.find(key) == g_servers.end());
+
+    if (isNew) {
+        // Anti-flood caps (I-18): bound the total registry and per-connection listings.
+        if (g_servers.size() >= MAX_REGISTERED_SERVERS) {
+            spdlog::warn("Master: Registry full ({}), rejecting new server from {}",
+                         g_servers.size(), peerIP);
+            return;
+        }
+        size_t fromPeer = 0;
+        for (auto& [k, s] : g_servers) if (s.peer == peer) fromPeer++;
+        if (fromPeer >= MAX_SERVERS_PER_PEER) {
+            spdlog::warn("Master: Peer {} exceeded per-peer server cap ({})", peerIP, fromPeer);
+            return;
+        }
+    }
+
     RegisteredServer srv;
-    srv.serverName = msg.serverName;
+    srv.serverName = SafeField(msg.serverName); // force-terminate before string conversion (RC4)
     srv.address = externalIP;
     srv.port = msg.gamePort;
     srv.currentPlayers = msg.currentPlayers;
@@ -91,7 +123,6 @@ void HandleRegister(ENetPeer* peer, const uint8_t* data, size_t size) {
     srv.lastHeartbeat = std::chrono::steady_clock::now();
     srv.peer = peer;
 
-    bool isNew = (g_servers.find(key) == g_servers.end());
     g_servers[key] = srv;
 
     if (isNew) {
@@ -203,6 +234,7 @@ void HandlePacket(ENetPeer* peer, const uint8_t* data, size_t size) {
     using namespace kmp;
 
     if (size < sizeof(PacketHeader)) return;
+    if (size > KMP_MAX_PACKET_SIZE) return; // bound per-message work (RC5)
     PacketReader reader(data, size);
     PacketHeader header;
     if (!reader.ReadHeader(header)) return;

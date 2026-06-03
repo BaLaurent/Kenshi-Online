@@ -27,6 +27,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=build /src/build-docker/bin/KenshiMP.Server       /opt/kenshi/KenshiMP.Server
 COPY --from=build /src/build-docker/bin/KenshiMP.MasterServer /opt/kenshi/KenshiMP.MasterServer
 
+# Run as a non-root user (I-23): the server needs no privileges, so a container
+# escape shouldn't land on root. The data dir is owned by this user so the
+# server can still write server.json / world.kmpsave / logs to the mounted volume.
+RUN useradd --system --uid 10001 --create-home --home-dir /home/kenshi kenshi \
+    && mkdir -p /data && chown -R kenshi:kenshi /data /opt/kenshi
+USER kenshi
+
 # Config (server.json), world save (world.kmpsave) and logs live here.
 # Mount a volume on /data to persist them across container restarts.
 WORKDIR /data

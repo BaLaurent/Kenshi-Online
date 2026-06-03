@@ -133,6 +133,22 @@ void Overlay::Update() {
             strncpy(hs.playerName, m_playerName, KMP_MAX_NAME_LENGTH);
             hs.playerName[KMP_MAX_NAME_LENGTH] = '\0';
 
+            // ── Authentication (protocol v2) ──
+            // Password / host-token come from client config (settable in client.json
+            // or a future UI field). The session token is the one this server issued
+            // us last time (per-server, keyed "ip:port"), so we reclaim our entities.
+            auto& cfg = core.GetConfig();
+            std::string serverKey = std::string(m_serverAddress) + ":" + m_serverPort;
+            strncpy(hs.password, cfg.serverPassword.c_str(), KMP_MAX_PASSWORD_LENGTH);
+            hs.password[KMP_MAX_PASSWORD_LENGTH] = '\0';
+            strncpy(hs.hostToken, cfg.hostToken.c_str(), KMP_SESSION_TOKEN_LENGTH);
+            hs.hostToken[KMP_SESSION_TOKEN_LENGTH] = '\0';
+            auto tokIt = cfg.sessionTokens.find(serverKey);
+            if (tokIt != cfg.sessionTokens.end()) {
+                strncpy(hs.sessionToken, tokIt->second.c_str(), KMP_SESSION_TOKEN_LENGTH);
+            }
+            hs.sessionToken[KMP_SESSION_TOKEN_LENGTH] = '\0';
+
             PacketWriter writer;
             writer.WriteHeader(MessageType::C2S_Handshake);
             writer.WriteRaw(&hs, sizeof(hs));

@@ -1,11 +1,88 @@
 #include "server.h"
+#include "entity_manager.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
 #include <cstdlib>
 #include <cmath>
+#include <cstring>
 #include <thread>
+#include <random>
 
 namespace kmp {
+
+// ── Authentication helpers (protocol v2) ──
+
+// Treat a fixed network char buffer as a C-string safely: force a NUL at the
+// final byte before any strlen/std::string conversion (RC4 hardening). Returns
+// a std::string bounded by the buffer.
+template <size_t N>
+static std::string SafeCStr(char (&buf)[N]) {
+    buf[N - 1] = '\0';
+    return std::string(buf);
+}
+
+// Length-independent equality for short auth secrets. Avoids early-out on the
+// first mismatching byte. On UDP the timing channel is largely illusory, but
+// this costs nothing and documents intent.
+static bool SecretEquals(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    unsigned char diff = 0;
+    for (size_t i = 0; i < a.size(); ++i)
+        diff |= static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]);
+    return diff == 0;
+}
+
+// ── Value validation at ingress (RC3) ──
+
+// Clamp an attacker-supplied health float to a finite, sane range. A NaN/Inf
+// health, if stored, propagates into clients' game memory and serializes as
+// JSON null — which throws on the next world load and wipes the save (I-10/I-13).
+static float SanitizeHealth(float h) {
+    if (!std::isfinite(h)) return 100.f;
+    return std::clamp(h, -1000.f, 100.f);
+}
+
+// Reject strings that are not well-formed UTF-8. nlohmann::json::dump throws on
+// invalid UTF-8; an attacker-supplied templateName containing raw bytes would
+// otherwise crash the autosave (I-09). (Persistence also uses error_handler::replace
+// as a second layer; this stops the bad name from being stored/broadcast at all.)
+static bool IsValidUtf8(const std::string& s) {
+    size_t i = 0, n = s.size();
+    while (i < n) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t extra;
+        if (c < 0x80) { extra = 0; }
+        else if ((c >> 5) == 0x6) { extra = 1; }
+        else if ((c >> 4) == 0xE) { extra = 2; }
+        else if ((c >> 3) == 0x1E) { extra = 3; }
+        else return false;
+        if (i + extra >= n) return false;
+        for (size_t k = 1; k <= extra; ++k) {
+            if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80) return false;
+        }
+        i += extra + 1;
+    }
+    return true;
+}
+
+std::string GameServer::GenerateSessionToken() {
+    // Draw 16 bytes straight from the platform CSPRNG (std::random_device is
+    // backed by /dev/urandom on glibc Linux and RtlGenRandom on MSVC). We do
+    // NOT seed a PRNG and read its stream: a hostile client collecting issued
+    // tokens could otherwise reconstruct the generator and derive other
+    // players' tokens. Each token is independent CSPRNG output.
+    std::random_device rd;
+    std::uniform_int_distribution<int> dist(0, 255);
+    static const char* hex = "0123456789abcdef";
+    std::string token;
+    token.reserve(KMP_SESSION_TOKEN_LENGTH);
+    for (int i = 0; i < KMP_SESSION_TOKEN_LENGTH / 2; ++i) {
+        int byte = dist(rd);
+        token += hex[(byte >> 4) & 0xF];
+        token += hex[byte & 0xF];
+    }
+    return token;
+}
 
 // Forward declaration from combat_resolver.cpp
 struct CombatResult {
@@ -208,6 +285,9 @@ void GameServer::Update(float deltaTime) {
                          orphans.size());
         }
         m_timeSinceOrphanCleanup = 0.f;
+        // Trim old rate-limit timestamps so the per-player vectors don't grow
+        // unbounded over a long session (RC5).
+        m_playerManager.CleanupRateLimits(m_uptime);
     }
 
     // Auto-save periodically
@@ -231,15 +311,41 @@ void GameServer::HandleConnect(ENetPeer* peer) {
     enet_address_get_host_ip(&peer->address, addrStr, sizeof(addrStr));
     spdlog::info("GameServer: Incoming connection from {}:{}", addrStr, peer->address.port);
 
+    // Enforce IP bans at the door (RC5/I-17 — the ban list was previously dead code).
+    if (m_playerManager.IsIPBanned(addrStr)) {
+        spdlog::warn("GameServer: Rejecting banned IP {}", addrStr);
+        enet_peer_disconnect_now(peer, 0);
+        return;
+    }
+
+    // Per-IP simultaneous-connection cap (RC5/I-16): blunt pre-handshake peer-slot
+    // exhaustion by limiting how many sockets a single address can hold open.
+    if (m_host) {
+        int sameIp = 0;
+        for (size_t i = 0; i < m_host->peerCount; ++i) {
+            ENetPeer* p = &m_host->peers[i];
+            if (p != peer && p->state == ENET_PEER_STATE_CONNECTED &&
+                p->address.host == peer->address.host) {
+                sameIp++;
+            }
+        }
+        if (sameIp >= KMP_MAX_CONNECTIONS_PER_IP) {
+            spdlog::warn("GameServer: Too many connections from {} ({}), rejecting", addrStr, sameIp);
+            enet_peer_disconnect_now(peer, 0);
+            return;
+        }
+    }
+
     if (m_players.size() >= static_cast<size_t>(m_config.maxPlayers)) {
         spdlog::warn("GameServer: Server full, rejecting connection");
         enet_peer_disconnect(peer, 0);
         return;
     }
 
-    // Connection accepted, wait for handshake
-    // 10s min / 15s max timeout — detect crashed clients within ~15 seconds
-    enet_peer_timeout(peer, 0, 10000, 15000);
+    // Connection accepted, wait for handshake.
+    // Shorter timeout (5s min / 8s max) so un-authenticated / crashed peers free
+    // their slot quickly, limiting pre-handshake slot squatting (I-16).
+    enet_peer_timeout(peer, 0, 5000, 8000);
     peer->data = nullptr;
 }
 
@@ -257,13 +363,24 @@ void GameServer::HandleDisconnect(ENetPeer* peer) {
                 ownedIds.push_back(eid);
             }
         }
-        if (!ownedIds.empty()) {
+        if (!ownedIds.empty() && !player->sessionToken.empty()) {
+            // Persist keyed by the secret session token, so only a reconnecting
+            // client presenting that token can reclaim these entities (RC1 fix).
             SavedPlayer sp;
+            sp.token = player->sessionToken;
             sp.name = player->name;
             sp.entityIds = ownedIds;
-            m_savedPlayers[player->name] = std::move(sp);
-            spdlog::info("GameServer: Preserved {} entities for player '{}' (reconnectable)",
+            m_savedPlayers[player->sessionToken] = std::move(sp);
+            spdlog::info("GameServer: Preserved {} entities for player '{}' (reconnectable via token)",
                          ownedIds.size(), player->name);
+
+            // Cap the saved-player table so a churn of disconnects can't grow it
+            // without bound (RC5 / I-19). Evict oldest-by-iteration when over cap.
+            while (m_savedPlayers.size() > KMP_MAX_SAVED_PLAYERS) {
+                auto victim = m_savedPlayers.begin();
+                if (victim->first == player->sessionToken) { ++victim; if (victim == m_savedPlayers.end()) break; }
+                m_savedPlayers.erase(victim);
+            }
         }
 
         // Notify others that player left
@@ -280,18 +397,16 @@ void GameServer::HandleDisconnect(ENetPeer* peer) {
         PlayerID leavingId = player->id;
         std::string leavingName = player->name;
         m_players.erase(leavingId);
+        m_playerManager.RemoveRateLimit(leavingId); // don't leak the rate-limit entry under churn (R3 follow-up)
 
-        // Reassign host if the host disconnected
+        // Host left: clear host. Do NOT auto-promote by connection/iterator order
+        // (RC1 fix — that granted admin to an arbitrary client with no credential).
+        // Host is regained only when a client reconnects with the configured host token.
         if (leavingId == m_hostPlayerId) {
             m_hostPlayerId = 0;
-            if (!m_players.empty()) {
-                auto it = m_players.begin();
-                m_hostPlayerId = it->first;
-                spdlog::info("GameServer: Host reassigned to '{}' (ID: {})", it->second.name, it->first);
-                BroadcastSystemMessage(it->second.name + " is now the host");
-            } else {
-                spdlog::info("GameServer: Last player left — no host assigned");
-            }
+            m_hostAuthenticated = false;
+            spdlog::info("GameServer: Host disconnected — host is now unassigned "
+                         "(reconnect with the host token to reclaim)");
         }
 
         // Broadcast system message
@@ -302,6 +417,14 @@ void GameServer::HandleDisconnect(ENetPeer* peer) {
 
 void GameServer::HandlePacket(ENetPeer* peer, const uint8_t* data, size_t size, int channel) {
     if (size < sizeof(PacketHeader)) return;
+    // Reject oversized packets up front. This bounds memory/CPU per message and,
+    // because the pipeline-relay handler forwards reader.Remaining() verbatim,
+    // also caps the relay amplification at this ceiling (I-08 / I-15) — far below
+    // ENet's 32 MB default packet limit.
+    if (size > KMP_MAX_PACKET_SIZE) {
+        spdlog::warn("GameServer: Dropping oversized packet ({} bytes) on channel {}", size, channel);
+        return;
+    }
 
     // Note: m_mutex is already held by Update() which calls this method.
     // Using recursive_mutex so public methods (KickPlayer, etc.) can also lock safely.
@@ -329,6 +452,35 @@ void GameServer::HandlePacket(ENetPeer* peer, const uint8_t* data, size_t size, 
     PacketReader reader(data, size);
     PacketHeader header;
     if (!reader.ReadHeader(header)) return;
+
+    // Per-player rate limiting for burst-prone, state-changing messages (RC5).
+    // Position/move/keepalive are intentionally excluded — they are high-frequency
+    // by design (20 Hz). PlayerManager was implemented but never wired in; this is
+    // the single call site that activates it (fixes spawn/build/chat/zone floods).
+    switch (header.type) {
+    case MessageType::C2S_EntitySpawnReq:
+    case MessageType::C2S_BuildRequest:
+    case MessageType::C2S_ChatMessage:
+    case MessageType::C2S_ZoneRequest:
+    case MessageType::C2S_FactionRelation:
+    case MessageType::C2S_TradeRequest:
+    case MessageType::C2S_SquadCreate:
+    case MessageType::C2S_SquadAddMember:
+    case MessageType::C2S_AdminCommand: {
+        if (auto* sender = GetPlayer(peer)) {
+            m_playerManager.RecordMessage(sender->id, m_uptime);
+            if (m_playerManager.CheckRateLimit(sender->id, m_uptime,
+                                               KMP_RATE_LIMIT_WINDOW_SEC, KMP_RATE_LIMIT_MAX_MSGS)) {
+                spdlog::warn("GameServer: Rate-limiting player '{}' (msg 0x{:02X})",
+                             sender->name, static_cast<uint8_t>(header.type));
+                return;
+            }
+        }
+        break;
+    }
+    default:
+        break;
+    }
 
     switch (header.type) {
     case MessageType::C2S_Handshake:
@@ -569,6 +721,27 @@ void GameServer::HandleHandshake(ENetPeer* peer, PacketReader& reader) {
         return;
     }
 
+    // ── Password check (protocol v2) ──
+    // Force-terminate the fixed network buffers before treating them as strings.
+    if (!m_config.password.empty()) {
+        std::string suppliedPassword = SafeCStr(msg.password);
+        if (!SecretEquals(suppliedPassword, m_config.password)) {
+            char addrStr[64];
+            enet_address_get_host_ip(&peer->address, addrStr, sizeof(addrStr));
+            spdlog::warn("GameServer: Rejected connection from {} — wrong password", addrStr);
+            PacketWriter writer;
+            writer.WriteHeader(MessageType::S2C_HandshakeReject);
+            MsgHandshakeReject reject{};
+            reject.reasonCode = 4; // bad password
+            snprintf(reject.reasonText, sizeof(reject.reasonText), "Incorrect server password");
+            writer.WriteRaw(&reject, sizeof(reject));
+            ENetPacket* pkt = enet_packet_create(writer.Data(), writer.Size(), ENET_PACKET_FLAG_RELIABLE);
+            if (pkt) enet_peer_send(peer, KMP_CHANNEL_RELIABLE_ORDERED, pkt);
+            enet_peer_disconnect_later(peer, 0);
+            return;
+        }
+    }
+
     // Sanitize player name: strip non-printable ASCII, enforce length
     std::string sanitizedName;
     for (int i = 0; i < KMP_MAX_NAME_LENGTH && msg.playerName[i] != '\0'; i++) {
@@ -586,30 +759,71 @@ void GameServer::HandleHandshake(ENetPeer* peer, PacketReader& reader) {
     player.ping = peer->roundTripTime;
     player.lastUpdate = m_uptime;
 
+    // Issue a fresh secret session token for this connection. The client must
+    // persist it (per-server) and present it on reconnect to reclaim entities.
+    player.sessionToken = GenerateSessionToken();
+    char joinAddr[64];
+    enet_address_get_host_ip(&peer->address, joinAddr, sizeof(joinAddr));
+    player.ipAddress = joinAddr;
+
     peer->data = reinterpret_cast<void*>(static_cast<uintptr_t>(id));
     m_players[id] = player;
 
-    // Reconnect: if this player name matches a saved record, reclaim their entities
-    auto savedIt = m_savedPlayers.find(sanitizedName);
-    if (savedIt != m_savedPlayers.end()) {
-        int reclaimed = 0;
-        for (EntityID eid : savedIt->second.entityIds) {
-            auto entIt = m_entities.find(eid);
-            if (entIt != m_entities.end() && entIt->second.owner == 0) {
-                entIt->second.owner = id;
-                m_players[id].ownedEntities.push_back(eid);
-                reclaimed++;
+    // Now authenticated: restore a generous timeout so high-latency players
+    // aren't dropped (R8). The short 5s/8s set at connect only needs to apply
+    // while the peer is un-handshaken (squatting a slot).
+    enet_peer_timeout(peer, 0, 10000, 15000);
+
+    // Reconnect: reclaim entities only if the client presents the SECRET token
+    // from its prior session (not a public display name — RC1 fix). The token
+    // is the map key, so a forged/empty token simply finds nothing.
+    std::string suppliedToken = SafeCStr(msg.sessionToken);
+    if (!suppliedToken.empty()) {
+        auto savedIt = m_savedPlayers.find(suppliedToken);
+        if (savedIt != m_savedPlayers.end()) {
+            int reclaimed = 0;
+            for (EntityID eid : savedIt->second.entityIds) {
+                auto entIt = m_entities.find(eid);
+                if (entIt != m_entities.end() && entIt->second.owner == 0) {
+                    entIt->second.owner = id;
+                    m_players[id].ownedEntities.push_back(eid);
+                    reclaimed++;
+                }
             }
+            spdlog::info("GameServer: Player '{}' reconnected via token — reclaimed {}/{} entities",
+                         sanitizedName, reclaimed, savedIt->second.entityIds.size());
+            m_savedPlayers.erase(savedIt);
+        } else {
+            spdlog::warn("GameServer: Player '{}' presented an unknown session token (no reclaim)",
+                         sanitizedName);
         }
-        spdlog::info("GameServer: Player '{}' reconnected — reclaimed {}/{} entities",
-                     sanitizedName, reclaimed, savedIt->second.entityIds.size());
-        m_savedPlayers.erase(savedIt);
     }
 
-    // First connected player is the host
+    // Host designation (RC1 fix). Two modes, by operator config:
+    //  - hostToken SET   → host granted ONLY to the client presenting that secret
+    //                      (secure; defeats the original "first connector is admin").
+    //  - hostToken EMPTY → operator opted out of secure designation (casual/LAN):
+    //                      fall back to first-connector host so self-hosted/solo
+    //                      sessions still have an admin and system faction changes
+    //                      (causer=0, host-only) keep working. Set a hostToken to
+    //                      require a credential. (R5: the strict-only version left
+    //                      default servers with no host at all.)
     if (m_hostPlayerId == 0) {
-        m_hostPlayerId = id;
-        spdlog::info("GameServer: Player '{}' is the HOST (ID: {})", player.name, id);
+        if (m_config.hostToken.empty()) {
+            // Gameplay host only — NOT admin-authenticated. Gets faction(causer=0)
+            // and build coordination, but kick/ban/time/weather stay denied (I-04).
+            m_hostPlayerId = id;
+            m_hostAuthenticated = false;
+            spdlog::info("GameServer: No host token configured — '{}' is gameplay host by connection "
+                         "order (ID {}); admin commands disabled (set hostToken to enable)", player.name, id);
+        } else {
+            std::string suppliedHostToken = SafeCStr(msg.hostToken);
+            if (SecretEquals(suppliedHostToken, m_config.hostToken)) {
+                m_hostPlayerId = id;
+                m_hostAuthenticated = true;
+                spdlog::info("GameServer: Player '{}' authenticated as HOST + ADMIN (ID: {})", player.name, id);
+            }
+        }
     }
 
     spdlog::info("GameServer: Player '{}' joined (ID: {}, {} players now)",
@@ -626,6 +840,9 @@ void GameServer::HandleHandshake(ENetPeer* peer, PacketReader& reader) {
         ack.weatherState = m_weatherState;
         ack.maxPlayers = static_cast<uint8_t>(m_config.maxPlayers);
         ack.currentPlayers = static_cast<uint8_t>(m_players.size());
+        ack.isHost = (id == m_hostPlayerId) ? 1 : 0;
+        strncpy(ack.sessionToken, player.sessionToken.c_str(), sizeof(ack.sessionToken) - 1);
+        ack.sessionToken[sizeof(ack.sessionToken) - 1] = '\0';
         writer.WriteRaw(&ack, sizeof(ack));
 
         ENetPacket* pkt = enet_packet_create(writer.Data(), writer.Size(), ENET_PACKET_FLAG_RELIABLE);
@@ -633,6 +850,9 @@ void GameServer::HandleHandshake(ENetPeer* peer, PacketReader& reader) {
             spdlog::error("Failed to create packet ({} bytes)", writer.Size());
             m_players.erase(id);
             peer->data = nullptr;
+            // Roll back host state if this aborted player had just claimed it,
+            // else a null-alloc would permanently lock out admin until restart.
+            if (id == m_hostPlayerId) { m_hostPlayerId = 0; m_hostAuthenticated = false; }
             return;
         }
         enet_peer_send(peer, KMP_CHANNEL_RELIABLE_ORDERED, pkt);
@@ -669,6 +889,9 @@ void GameServer::HandleHandshake(ENetPeer* peer, PacketReader& reader) {
             spdlog::error("Failed to create packet ({} bytes)", factionWriter.Size());
             m_players.erase(id);
             peer->data = nullptr;
+            // Roll back host state if this aborted player had just claimed it,
+            // else a null-alloc would permanently lock out admin until restart.
+            if (id == m_hostPlayerId) { m_hostPlayerId = 0; m_hostAuthenticated = false; }
             return;
         }
         enet_peer_send(peer, KMP_CHANNEL_RELIABLE_ORDERED, factionPkt);
@@ -771,12 +994,31 @@ void GameServer::HandlePositionUpdate(ConnectedPlayer& player, PacketReader& rea
         // Update server-side entity position
         auto it = m_entities.find(pos.entityId);
         if (it != m_entities.end() && it->second.owner == player.id) {
+            // Anti-teleport (I-01/02/12 keystone): reject a jump faster than
+            // KMP_MAX_MOVE_SPEED. Without this, an attacker teleports an owned
+            // entity onto a victim/door and the combat/proximity distance gates
+            // (which trust this server-side position) pass at distance 0. Skip the
+            // first update per entity (no baseline); floor dt to avoid div blow-up.
+            if (it->second.lastPosTime > 0.f) {
+                float dt = m_uptime - it->second.lastPosTime;
+                if (dt < 0.02f) dt = 0.02f;
+                float ddx = pos.posX - it->second.position.x;
+                float ddy = pos.posY - it->second.position.y;
+                float ddz = pos.posZ - it->second.position.z;
+                float dist = std::sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
+                if (dist > KMP_MAX_MOVE_SPEED * dt) {
+                    spdlog::warn("GameServer: Rejected teleport-speed move from '{}' entity {} ({:.0f}m in {:.2f}s)",
+                                 player.name, pos.entityId, dist, dt);
+                    continue;
+                }
+            }
             it->second.position = Vec3(pos.posX, pos.posY, pos.posZ);
             it->second.rotation = Quat::Decompress(pos.compressedQuat);
             it->second.zone = ZoneCoord::FromWorldPos(it->second.position);
             it->second.animState = pos.animStateId;
             it->second.moveSpeed = pos.moveSpeed;
             it->second.flags = pos.flags;
+            it->second.lastPosTime = m_uptime;
 
             // Use the first owned entity's position for zone tracking
             if (!playerPosUpdated) {
@@ -795,6 +1037,19 @@ void GameServer::HandleMoveCommand(ConnectedPlayer& player, PacketReader& reader
     // Validate entity ownership
     auto it = m_entities.find(msg.entityId);
     if (it == m_entities.end() || it->second.owner != player.id) return;
+
+    // Reject non-finite / extreme move targets before rebroadcast. This message
+    // is relayed verbatim to all other clients, so an unvalidated NaN/Inf target
+    // would propagate straight into their game memory (R9 — same class as the
+    // spawn/limb-health NaN guards).
+    if (std::isnan(msg.targetX) || std::isnan(msg.targetY) || std::isnan(msg.targetZ) ||
+        std::isinf(msg.targetX) || std::isinf(msg.targetY) || std::isinf(msg.targetZ) ||
+        std::abs(msg.targetX) > 1000000.f || std::abs(msg.targetY) > 1000000.f ||
+        std::abs(msg.targetZ) > 1000000.f) {
+        spdlog::warn("GameServer: Rejected invalid move target from '{}' entity {}",
+                     player.name, msg.entityId);
+        return;
+    }
 
     // Broadcast to other players
     PacketWriter writer;
@@ -919,6 +1174,13 @@ void GameServer::HandleBuildRequest(ConnectedPlayer& player, PacketReader& reade
     if (distSq > MAX_BUILD_DISTANCE * MAX_BUILD_DISTANCE) {
         spdlog::warn("GameServer: Rejected build from '{}' too far from player ({:.0f}m away)",
                      player.name, std::sqrt(distSq));
+        return;
+    }
+
+    // Enforce per-player entity cap (RC5/I-14) — buildings count toward the budget.
+    if (EntityManager::WouldExceedLimit(m_entities, player.id, KMP_MAX_ENTITIES_PER_PLAYER)) {
+        spdlog::warn("GameServer: Player '{}' hit per-player entity cap ({}) — rejecting build",
+                     player.name, KMP_MAX_ENTITIES_PER_PLAYER);
         return;
     }
 
@@ -1061,6 +1323,18 @@ void GameServer::HandleEntitySpawnReq(ConnectedPlayer& player, PacketReader& rea
     if (!reader.ReadU32(compQuat)) return;
     if (!reader.ReadU32(factionId)) return;
 
+    // Validate spawn coordinates — reject NaN/Inf/extreme (R2 fix, mirrors
+    // HandleBuildRequest). A NaN position would serialize as JSON null and throw
+    // on the next world load → permanent world wipe (I-10), and would also defeat
+    // the door proximity gate (NaN distance comparison is always false → I-12).
+    if (std::isnan(px) || std::isnan(py) || std::isnan(pz) ||
+        std::isinf(px) || std::isinf(py) || std::isinf(pz) ||
+        std::abs(px) > 1000000.f || std::abs(py) > 1000000.f || std::abs(pz) > 1000000.f) {
+        spdlog::warn("GameServer: Rejected spawn with invalid position from '{}' ({},{},{})",
+                     player.name, px, py, pz);
+        return;
+    }
+
     // Read optional template name
     std::string templateName;
     uint16_t nameLen = 0;
@@ -1069,6 +1343,12 @@ void GameServer::HandleEntitySpawnReq(ConnectedPlayer& player, PacketReader& rea
         if (nameLen > 0 && nameLen <= 255 && reader.Remaining() >= nameLen) {
             templateName.resize(nameLen);
             reader.ReadRaw(templateName.data(), nameLen);
+            // Reject invalid UTF-8 so it can't crash the JSON autosave (I-09).
+            if (!IsValidUtf8(templateName)) {
+                spdlog::warn("GameServer: Player '{}' sent non-UTF-8 templateName — dropping name",
+                             player.name);
+                templateName.clear();
+            }
         }
     }
 
@@ -1082,6 +1362,8 @@ void GameServer::HandleEntitySpawnReq(ConnectedPlayer& player, PacketReader& rea
         if (extFlag == 1 && reader.Remaining() >= 7 * 4 + 1) {
             hasExtended = true;
             for (int i = 0; i < 7; i++) reader.ReadF32(healthData[i]);
+            // Reject NaN/Inf so it never reaches the world save (I-10).
+            for (int i = 0; i < 7; i++) healthData[i] = SanitizeHealth(healthData[i]);
             uint8_t aliveFlag = 1;
             reader.ReadU8(aliveFlag);
             isAlive = (aliveFlag != 0);
@@ -1098,6 +1380,14 @@ void GameServer::HandleEntitySpawnReq(ConnectedPlayer& player, PacketReader& rea
     if (m_entities.size() >= KMP_MAX_SYNC_ENTITIES) {
         spdlog::warn("GameServer: Entity limit reached ({}) — rejecting spawn from '{}'",
                       m_entities.size(), player.name);
+        return;
+    }
+
+    // Enforce per-player entity cap (RC5/I-07) — one client can't exhaust the
+    // global budget on its own. PlayerManager/EntityManager were unused until now.
+    if (EntityManager::WouldExceedLimit(m_entities, player.id, KMP_MAX_ENTITIES_PER_PLAYER)) {
+        spdlog::warn("GameServer: Player '{}' hit per-player entity cap ({}) — rejecting spawn",
+                     player.name, KMP_MAX_ENTITIES_PER_PLAYER);
         return;
     }
 
@@ -1461,13 +1751,19 @@ void GameServer::SaveWorld() {
     // (their live entity ownership) with previously-saved offline players.
     auto savedForWrite = m_savedPlayers;
     for (auto& [pid, cp] : m_players) {
+        // Key live players by their SECRET session token, not the public display
+        // name (R1 fix). Keying by name re-opened I-05: after autosave+restart the
+        // map key became the public name and any client could reclaim by sending
+        // that name as its session token.
+        if (cp.sessionToken.empty()) continue;
         SavedPlayer sp;
+        sp.token = cp.sessionToken;
         sp.name = cp.name;
         for (auto& [eid, entity] : m_entities) {
             if (entity.owner == pid) sp.entityIds.push_back(eid);
         }
         if (!sp.entityIds.empty()) {
-            savedForWrite[cp.name] = std::move(sp);
+            savedForWrite[cp.sessionToken] = std::move(sp);
         }
     }
 
@@ -1682,14 +1978,25 @@ void GameServer::HandleFactionRelation(ConnectedPlayer& player, PacketReader& re
     MsgFactionRelation msg;
     if (!reader.ReadRaw(&msg, sizeof(msg))) return;
 
-    // Validate relation bounds
-    if (msg.relation < -100.f || msg.relation > 100.f) {
+    // Validate relation bounds. isfinite first: NaN fails BOTH comparisons below
+    // (IEEE-754 unordered), so without this a NaN relation would slip through and
+    // be broadcast to all clients (R7).
+    if (!std::isfinite(msg.relation) || msg.relation < -100.f || msg.relation > 100.f) {
         spdlog::warn("GameServer: Player '{}' sent invalid relation value {:.1f}", player.name, msg.relation);
         return;
     }
 
-    // Validate causer entity belongs to this player (if non-zero)
-    if (msg.causerEntityId != 0) {
+    // Authorize the faction change. Previously causerEntityId==0 ("system")
+    // bypassed the ownership check entirely, letting any client rewrite global
+    // faction standings (I-06). Now: causer 0 is host-only; any other causer
+    // must be an entity owned by the sender.
+    if (msg.causerEntityId == 0) {
+        if (player.id != m_hostPlayerId) {
+            spdlog::warn("GameServer: Non-host player '{}' tried a system (causer=0) faction change",
+                         player.name);
+            return;
+        }
+    } else {
         auto it = m_entities.find(msg.causerEntityId);
         if (it == m_entities.end() || it->second.owner != player.id) {
             spdlog::warn("GameServer: Player '{}' sent faction relation with invalid causer {}",
@@ -1805,6 +2112,28 @@ void GameServer::HandleCombatStance(ConnectedPlayer& player, PacketReader& reade
                    KMP_CHANNEL_RELIABLE_UNORDERED, ENET_PACKET_FLAG_RELIABLE);
 }
 
+// ── Combat authority helpers (RC2) ──
+//
+// IMPORTANT ARCHITECTURAL NOTE: combat in this mod is client-authoritative by
+// design — the Kenshi engine on each client computes KO/death locally (via the
+// hooked CharacterDeath/CharacterKO functions) and REPORTS the result; the
+// attacker's machine reports the victim's death. The server's ResolveCombat is
+// a parallel model that is never driven (the client never sends C2S_AttackIntent).
+// We therefore cannot make combat fully server-authoritative without simulating
+// Kenshi's engine server-side (out of scope). Instead we bound the report model:
+// reject non-finite values and require the reporter's entity to actually be
+// within combat range of the target — turning "one-shot any entity anywhere"
+// into "must be in combat range", mirroring HandleAttackIntent's own gate.
+static constexpr float KMP_MAX_COMBAT_REPORT_DISTANCE = 150.f; // generous (ranged) bound
+
+static bool WithinCombatRange(const ServerEntity& a, const ServerEntity& b) {
+    float dx = a.position.x - b.position.x;
+    float dy = a.position.y - b.position.y;
+    float dz = a.position.z - b.position.z;
+    float distSq = dx * dx + dy * dy + dz * dz;
+    return distSq <= KMP_MAX_COMBAT_REPORT_DISTANCE * KMP_MAX_COMBAT_REPORT_DISTANCE;
+}
+
 // ── Combat KO Handler ──
 
 void GameServer::HandleCombatKO(ConnectedPlayer& player, PacketReader& reader) {
@@ -1814,6 +2143,14 @@ void GameServer::HandleCombatKO(ConnectedPlayer& player, PacketReader& reader) {
     float chestHealth = 0.f;
     if (!reader.ReadU32(entityId) || !reader.ReadU32(attackerId) ||
         !reader.ReadU8(reason) || !reader.ReadF32(chestHealth)) return;
+
+    // Reject non-finite health: a NaN/Inf would be written to server state,
+    // rebroadcast into clients' game memory, and crash the JSON autosave (I-02/I-13).
+    if (!std::isfinite(chestHealth)) {
+        spdlog::warn("GameServer: Player '{}' sent non-finite KO health for entity {}", player.name, entityId);
+        return;
+    }
+    chestHealth = std::clamp(chestHealth, -1000.f, 100.f);
 
     // Validate entity exists and is alive (reject KO on dead entities)
     auto it = m_entities.find(entityId);
@@ -1827,6 +2164,18 @@ void GameServer::HandleCombatKO(ConnectedPlayer& player, PacketReader& reader) {
         attackerIsReporter = (attackerIt != m_entities.end() && attackerIt->second.owner == player.id);
     }
     if (!victimIsReporter && !attackerIsReporter) return;
+
+    // Cross-player KO (reporter is the attacker, not the victim's owner): require
+    // the attacker entity to actually be within combat range of the victim, so a
+    // modified client cannot KO arbitrary entities anywhere on the map (RC2/I-02).
+    if (attackerIsReporter && !victimIsReporter) {
+        auto attackerIt = m_entities.find(attackerId);
+        if (attackerIt == m_entities.end() || !WithinCombatRange(attackerIt->second, it->second)) {
+            spdlog::warn("GameServer: Rejected out-of-range KO from '{}' (attacker {} vs victim {})",
+                         player.name, attackerId, entityId);
+            return;
+        }
+    }
 
     spdlog::info("GameServer: Player '{}' reports entity {} KO (attacker={}, reason={}, health={:.1f})",
                  player.name, entityId, attackerId, reason, chestHealth);
@@ -1878,6 +2227,20 @@ void GameServer::HandleCombatDeath(ConnectedPlayer& player, PacketReader& reader
     }
     if (!victimIsReporter && !killerIsReporter) return;
 
+    // Cross-player kill (reporter owns the killer, not the victim): require the
+    // killer entity to be within combat range of the victim. This is the fix for
+    // the critical one-shot-any-entity exploit (I-01): a modified client can no
+    // longer mark an arbitrary character anywhere on the map as dead — it must
+    // own a killer entity that is physically next to the victim.
+    if (killerIsReporter && !victimIsReporter) {
+        auto killerIt = m_entities.find(msg.killerId);
+        if (killerIt == m_entities.end() || !WithinCombatRange(killerIt->second, it->second)) {
+            spdlog::warn("GameServer: Rejected out-of-range death report from '{}' (killer {} vs victim {})",
+                         player.name, msg.killerId, msg.entityId);
+            return;
+        }
+    }
+
     // Mark entity as dead on the server so future attacks are rejected
     it->second.alive = false;
 
@@ -1903,8 +2266,11 @@ void GameServer::HandleLimbHealth(ConnectedPlayer& player, PacketReader& reader)
     auto it = m_entities.find(msg.entityId);
     if (it == m_entities.end() || it->second.owner != player.id) return;
 
-    // Store limb health values on server entity
+    // Sanitize each limb value (NaN/Inf would propagate into clients' game
+    // memory and the world save — I-13). Rewrite msg too so the rebroadcast
+    // below carries only finite values.
     for (int i = 0; i < 7; i++) {
+        msg.health[i] = SanitizeHealth(msg.health[i]);
         it->second.limbHealth[i] = msg.health[i];
     }
 
@@ -2021,6 +2387,29 @@ void GameServer::HandleDoorInteract(ConnectedPlayer& player, PacketReader& reade
     // Validate action
     if (msg.action > 3) return;
 
+    // Proximity: the actor must be next to the door/gate — no remote door ops
+    // across the map (I-12). Mirrors the build-distance discipline.
+    {
+        constexpr float DOOR_INTERACT_DISTANCE = 12.f;
+        float dx = actorIt->second.position.x - buildingIt->second.position.x;
+        float dy = actorIt->second.position.y - buildingIt->second.position.y;
+        float dz = actorIt->second.position.z - buildingIt->second.position.z;
+        if (dx * dx + dy * dy + dz * dz > DOOR_INTERACT_DISTANCE * DOOR_INTERACT_DISTANCE) {
+            spdlog::warn("GameServer: Player '{}' tried to interact with distant door {}",
+                         player.name, msg.entityId);
+            return;
+        }
+    }
+
+    // Lock (2) / unlock (3) are base-defense actions: only the building owner
+    // (or host) may change the lock state, even when standing next to it (I-12).
+    if ((msg.action == 2 || msg.action == 3) &&
+        buildingIt->second.owner != player.id && player.id != m_hostPlayerId) {
+        spdlog::warn("GameServer: Player '{}' tried to {} door {} they don't own",
+                     player.name, msg.action == 2 ? "lock" : "unlock", msg.entityId);
+        return;
+    }
+
     const char* actionNames[] = {"open", "close", "lock", "unlock"};
     spdlog::info("GameServer: Player '{}' {} door/gate {}",
                  player.name, actionNames[msg.action], msg.entityId);
@@ -2074,9 +2463,17 @@ void GameServer::HandleAdminCommand(ConnectedPlayer& player, PacketReader& reade
     MsgAdminCommand msg;
     if (!reader.ReadRaw(&msg, sizeof(msg))) return;
 
-    // Only the host can issue admin commands
-    if (player.id != m_hostPlayerId) {
-        spdlog::warn("GameServer: Non-host player '{}' tried admin command type {}",
+    // Force-terminate the fixed text buffer before it is ever read as a C-string
+    // (msg.textParam[0] check and std::string conversion below). Without this an
+    // attacker can omit the NUL and over-read the server stack, then have the
+    // result broadcast to every client (I-11 / RC4).
+    msg.textParam[sizeof(msg.textParam) - 1] = '\0';
+
+    // Admin commands (kick/ban/time/weather) require a TOKEN-AUTHENTICATED host.
+    // A first-connector gameplay host (no hostToken configured) is NOT admin —
+    // otherwise an open server would hand kick/ban to whoever connects first (I-04).
+    if (player.id != m_hostPlayerId || !m_hostAuthenticated) {
+        spdlog::warn("GameServer: Player '{}' tried admin command type {} without authenticated-host rights",
                      player.name, msg.commandType);
         PacketWriter writer;
         writer.WriteHeader(MessageType::S2C_AdminResponse);
@@ -2118,6 +2515,32 @@ void GameServer::HandleAdminCommand(ConnectedPlayer& player, PacketReader& reade
             responseText = "Kicked " + target->name;
         } else {
             responseText = "Player not found or cannot kick host.";
+        }
+        break;
+    }
+    case 1: { // Ban (RC5/I-17 — ban list was previously unreachable)
+        auto* target = GetPlayer(msg.targetPlayerId);
+        if (target && target->id != m_hostPlayerId) {
+            std::string banned = target->name;
+            if (!target->ipAddress.empty()) {
+                m_playerManager.BanIP(target->ipAddress);
+            }
+            std::string reason = msg.textParam[0] ? msg.textParam : "Banned by host";
+            BroadcastSystemMessage(banned + " was banned: " + reason);
+
+            PacketWriter banWriter;
+            banWriter.WriteHeader(MessageType::S2C_HandshakeReject);
+            MsgHandshakeReject reject{};
+            reject.reasonCode = 2; // banned
+            strncpy(reject.reasonText, reason.c_str(), sizeof(reject.reasonText) - 1);
+            banWriter.WriteRaw(&reject, sizeof(reject));
+            ENetPacket* banPkt = enet_packet_create(banWriter.Data(), banWriter.Size(), ENET_PACKET_FLAG_RELIABLE);
+            if (banPkt) enet_peer_send(target->peer, KMP_CHANNEL_RELIABLE_ORDERED, banPkt);
+            enet_peer_disconnect_later(target->peer, 0);
+
+            responseText = "Banned " + banned;
+        } else {
+            responseText = "Player not found or cannot ban host.";
         }
         break;
     }
