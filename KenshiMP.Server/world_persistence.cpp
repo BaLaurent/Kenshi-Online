@@ -6,10 +6,15 @@
 #include <cmath>
 #include <spdlog/spdlog.h>
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include <cerrno>
+#include <cstring>
+#endif
 
 namespace kmp {
 
@@ -83,6 +88,7 @@ bool SaveWorldToFile(const std::string& path,
         file.close();
     }
 
+#ifdef _WIN32
     // MoveFileExA with MOVEFILE_REPLACE_EXISTING is atomic on NTFS:
     // it replaces the destination in a single filesystem operation.
     // MOVEFILE_WRITE_THROUGH ensures the move is flushed to disk before returning.
@@ -109,6 +115,15 @@ bool SaveWorldToFile(const std::string& path,
         // Clean up backup on success
         std::remove(backupPath.c_str());
     }
+#else
+    // POSIX rename() atomically replaces the destination on the same filesystem,
+    // so no temp-rotation fallback is needed (unlike Windows' non-atomic rename).
+    if (std::rename(tmpPath.c_str(), path.c_str()) != 0) {
+        spdlog::error("SaveWorld: rename '{}' -> '{}' failed: {}", tmpPath, path, std::strerror(errno));
+        std::remove(tmpPath.c_str());
+        return false;
+    }
+#endif
 
     spdlog::info("SaveWorld: Saved {} entities to '{}'", entities.size(), path);
     return true;

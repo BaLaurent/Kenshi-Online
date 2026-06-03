@@ -62,6 +62,29 @@ save     - Save world state
 stop     - Shutdown server
 ```
 
+## Linux support
+
+The **dedicated server** and **master server** build and run natively on Linux (tested on
+Arch Linux / gcc 16 and Debian bookworm / gcc 12). A Docker image and `docker-compose.yml`
+are provided.
+
+- **Host the server on Linux** (Docker + Tailscale): see [docs/LINUX-SERVER.md](docs/LINUX-SERVER.md)
+- **Play from Linux via Steam Proton** (the Windows client DLL runs under Wine — plugin
+  injection + MinHook hooking confirmed with Kenshi 1.0.68 + Proton Experimental; full in-game
+  co-op sync is yours to confirm in a real session): see [docs/LINUX-CLIENT-PROTON.md](docs/LINUX-CLIENT-PROTON.md)
+
+```bash
+# Native server build
+cmake -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build-linux --target KenshiMP.Server
+# or, with Docker:
+docker compose up -d --build
+```
+
+> The Windows-only client toolchain (injector, in-game hooks, scanner) is excluded from the
+> Linux build via `if(WIN32)` guards in CMake; only `KenshiMP.Common`, `KenshiMP.Server` and
+> `KenshiMP.MasterServer` compile on Linux.
+
 ## Building
 
 ### Requirements

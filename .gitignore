@@ -1,10 +1,15 @@
 # Build output
 build/
 build-debug/
+build-linux/
+build-docker/
 out/
 x64/
 Debug/
 Release/
+
+# Generated client distribution package (rebuild from dist/ when needed)
+kenshi-online-client-windows.zip
 
 # Visual Studio
 .vs/

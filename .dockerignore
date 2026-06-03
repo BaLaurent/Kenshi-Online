@@ -1,0 +1,18 @@
+# Build artifacts — never needed in the image context
+build/
+build-linux/
+build-docker/
+out/
+.git/
+
+# Prebuilt Windows binaries (we rebuild the server from source)
+*.exe
+*.dll
+*.lib
+*.pdb
+*.obj
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.log

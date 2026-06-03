@@ -1,0 +1,23 @@
+# Kenshi-Online dedicated server on Linux.
+#
+# Networking model: Tailscale runs on the HOST (not in this container).
+# The published UDP port below is reachable on the host's tailnet IP, so
+# friends who join your shared node connect to  <tailnet-ip>:27800.
+#   ⚠ Tailscale Funnel does NOT work here — it only carries TCP/HTTPS,
+#     and this game is UDP. Use tailnet node-sharing instead.
+#
+# Usage:
+#   docker compose up -d --build      # build + run in background
+#   docker compose logs -f            # watch server logs
+#   docker compose down               # stop
+
+services:
+  kenshi-server:
+    build: .
+    container_name: kenshi-online-server
+    restart: unless-stopped
+    ports:
+      - "27800:27800/udp"
+    volumes:
+      # server.json, world.kmpsave and the server log persist here on the host
+      - ./server-data:/data

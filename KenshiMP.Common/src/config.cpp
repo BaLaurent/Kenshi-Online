@@ -2,8 +2,15 @@
 #include "kmp/constants.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
-#include <shlobj.h>
 #include <algorithm>
+
+#ifdef _WIN32
+#include <shlobj.h>
+#else
+#include <cstdlib>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace kmp {
 
@@ -19,6 +26,7 @@ static T Clamp(T value, T lo, T hi) {
 // ── ClientConfig ──
 
 std::string ClientConfig::GetDefaultPath() {
+#ifdef _WIN32
     char path[MAX_PATH];
     if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, path))) {
         std::string dir = std::string(path) + "\\KenshiMP";
@@ -26,11 +34,21 @@ std::string ClientConfig::GetDefaultPath() {
         return dir + "\\client.json";
     }
     return "client.json";
+#else
+    const char* home = std::getenv("HOME");
+    if (home) {
+        std::string dir = std::string(home) + "/.config/KenshiMP";
+        mkdir(dir.c_str(), 0755);
+        return dir + "/client.json";
+    }
+    return "client.json";
+#endif
 }
 
 std::string ClientConfig::GetInstancePath() {
     // PID-specific config path so multiple game instances don't collide.
     // Each Kenshi process gets its own config file for saving state.
+#ifdef _WIN32
     char path[MAX_PATH];
     if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, path))) {
         std::string dir = std::string(path) + "\\KenshiMP";
@@ -39,6 +57,15 @@ std::string ClientConfig::GetInstancePath() {
         return dir + "\\client_" + std::to_string(pid) + ".json";
     }
     return "client.json";
+#else
+    const char* home = std::getenv("HOME");
+    if (home) {
+        std::string dir = std::string(home) + "/.config/KenshiMP";
+        mkdir(dir.c_str(), 0755);
+        return dir + "/client_" + std::to_string(getpid()) + ".json";
+    }
+    return "client.json";
+#endif
 }
 
 bool ClientConfig::Load(const std::string& path) {
